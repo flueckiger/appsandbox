@@ -1,0 +1,91 @@
+# Builds the win-x64 app binaries (AppSandboxCore + AppSandbox) in GitHub Actions.
+#
+# What it compiles (all WDK-free projects from AppSandbox.sln):
+#   AppSandboxCore.vcxproj      -> bin/Release/appsandbox_core.dll
+#                                  (compiles the cherry-picked files:
+#                                   src/backend_win/asb_core.c, hcn_network.c, hcn_network.h)
+#   tools/agent/* + iso-patch   -> guest tools + bin/Release/iso-patch.exe
+#                                  (also populate release\resources for the app's post-build)
+#   AppSandbox.vcxproj          -> bin/Release/AppSandbox.exe
+#
+# What it deliberately does NOT build:
+#   The WDK driver projects (AppSandboxVDD/VAD/SHM) and their packaging projects.
+#   They need the Windows Driver Kit, which is not installed on GitHub's hosted
+#   runners. Use a self-hosted runner for a full driver build.
+#
+# Signing / release ZIP:
+#   The AppSandboxPackage project is skipped here (it is only wired into the
+#   solution build and is gated on the App Sandbox LLC EV YubiKey, which is not
+#   present in CI). The result is an unsigned dev build. No secrets required.
+
+name: Build win-x64
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-win-x64:
+    runs-on: windows-latest   # Windows Server 2022, Visual Studio 2022 (MSBuild 17.x)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Locate MSBuild (native amd64, like tools/sign/make-release.ps1)
+        id: msbuild
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $root = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          if (-not $root) { throw "Visual Studio MSBuild not found via vswhere" }
+          $msb = Join-Path $root "MSBuild\Current\Bin\amd64\MSBuild.exe"
+          if (-not (Test-Path $msb)) { $msb = Join-Path $root "MSBuild\Current\Bin\MSBuild.exe" }
+          if (-not (Test-Path $msb)) { throw "MSBuild.exe not found under $root" }
+          Add-Content $env:GITHUB_OUTPUT "msbuild=$msb"
+          Write-Host "Using $msb"
+
+      - name: Build (Release | x64)
+        shell: pwsh
+        run: |
+          $mb = "${{ steps.msbuild.outputs.msbuild }}"
+          $args = @('/t:Build', '/p:Configuration=Release', '/p:Platform=x64', '/m', '/nologo', '/v:minimal')
+          # Order matters:
+          #  1. AppSandboxCore  - the DLL containing the cherry-picked HCN code
+          #  2. guest tools     - their post-build events create/populate release\resources
+          #  3. iso-patch       - needed next to the app in bin\Release
+          #  4. AppSandbox      - post-build xcopy from release\resources, web, vendor\webview2
+          $projects = @(
+            'AppSandboxCore.vcxproj',
+            'tools\agent\agent.vcxproj',
+            'tools\agent\appsandbox-input.vcxproj',
+            'tools\agent\appsandbox-displays.vcxproj',
+            'tools\agent\appsandbox-clipboard.vcxproj',
+            'tools\agent\appsandbox-clipboard-reader.vcxproj',
+            'tools\agent\appsandbox-audio.vcxproj',
+            'tools\iso-patch\iso-patch.vcxproj',
+            'AppSandbox.vcxproj'
+          )
+          foreach ($p in $projects) {
+            Write-Host "==== Building $p ===="
+            & $mb $p @args
+            if ($LASTEXITCODE -ne 0) { throw "Build of $p failed (exit $LASTEXITCODE)" }
+          }
+          Write-Host "All projects built."
+
+      - name: Show build output
+        shell: pwsh
+        run: |
+          Get-ChildItem bin/Release -File | Sort-Object Name |
+            Select-Object Name, @{n='SizeMB';e={[math]::Round($_.Length/1MB,2)}}, LastWriteTime |
+            Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: appsandbox-win-x64-release
+          path: |
+            bin/Release/*
+            !bin/Release/*.pdb
+          if-no-files-found: error
+          retention-days: 14
